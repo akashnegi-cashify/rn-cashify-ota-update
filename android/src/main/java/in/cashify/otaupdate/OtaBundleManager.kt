@@ -1,7 +1,6 @@
 package `in`.cashify.otaupdate
 
 import android.content.Context
-import android.util.Log
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -49,42 +48,46 @@ object OtaBundleManager {
         val tag = "OtaBundleManager::getLauncherBundleFilePathLocal"
         return try {
             if (HostAppInfo.isDebuggable(context)) {
-                Log.d("CashifyOTA", "$tag::debuggable build, using default bundle source")
+                OtaLog.d("$tag::debuggable build, using default bundle source")
                 return null
             }
             if (OtaPreferences.isSafeModeEnabled(context)) {
-                Log.d("CashifyOTA", "$tag::safe mode enabled, using asset bundle")
+                OtaLog.d("$tag::safe mode enabled, using asset bundle")
+                return null
+            }
+            if (OtaPreferences.isLocalSafeModeEnabled(context)) {
+                OtaLog.d("$tag::local safe-mode override enabled, using asset bundle")
                 return null
             }
             val module = OtaModuleManager.launcherModule()
             if (module == null) {
-                Log.d("CashifyOTA", "$tag::no launcher module configured, using asset bundle")
+                OtaLog.d("$tag::no launcher module configured, using asset bundle")
                 return null
             }
             if (OtaPreferences.isModuleSafeModeEnabled(context, module.configKey)) {
-                Log.d("CashifyOTA", "$tag::module safe mode enabled for ${module.moduleName}, using asset bundle")
+                OtaLog.d("$tag::module safe mode enabled for ${module.moduleName}, using asset bundle")
                 return null
             }
             val assetVersion = getJsBundleAssetVersion(module)
             val diskVersion = getJsBundleDiskVersion(context, module)
             if (diskVersion == null) {
-                Log.d("CashifyOTA", "$tag::no valid disk bundle, using asset bundle ($assetVersion)")
+                OtaLog.d("$tag::no valid disk bundle, using asset bundle ($assetVersion)")
                 OtaModuleManager.setBundleVersion(module.moduleName, assetVersion ?: "")
                 return null
             }
             // Asset wins ties: disk must be STRICTLY newer than the shipped bundle.
             if (assetVersion != null && listOf(diskVersion, assetVersion).semanticMax() == assetVersion) {
-                Log.d("CashifyOTA", "$tag::disk $diskVersion <= asset $assetVersion, using asset bundle")
+                OtaLog.d("$tag::disk $diskVersion <= asset $assetVersion, using asset bundle")
                 OtaModuleManager.setBundleVersion(module.moduleName, assetVersion)
                 return null
             }
             val bundleFile = buildJsBundleFilePath(context, module, diskVersion)
             launcherLoadedBundleVersion = diskVersion
             OtaModuleManager.setBundleVersion(module.moduleName, diskVersion)
-            Log.d("CashifyOTA", "$tag::loading disk bundle $diskVersion: ${bundleFile.absolutePath}")
+            OtaLog.d("$tag::loading disk bundle $diskVersion: ${bundleFile.absolutePath}")
             bundleFile.absolutePath
         } catch (t: Throwable) {
-            Log.e("CashifyOTA", "$tag::failed, falling back to asset bundle: ${t.message}", t)
+            OtaLog.e("$tag::failed, falling back to asset bundle: ${t.message}", t)
             null
         }
     }
@@ -101,6 +104,7 @@ object OtaBundleManager {
             ?: throw IllegalArgumentException("$tag::module not found")
 
         val safeMode = OtaPreferences.isSafeModeEnabled(context) ||
+            OtaPreferences.isLocalSafeModeEnabled(context) ||
             OtaPreferences.isModuleSafeModeEnabled(context, module.configKey)
         if (!safeMode) {
             val diskVersion = getJsBundleDiskVersion(context, module)
@@ -111,13 +115,13 @@ object OtaBundleManager {
             ) {
                 val bundleFile = buildJsBundleFilePath(context, module, diskVersion)
                 OtaModuleManager.setBundleVersion(module.moduleName, diskVersion)
-                Log.d("CashifyOTA", "$tag::disk bundle $diskVersion")
+                OtaLog.d("$tag::disk bundle $diskVersion")
                 return bundleFile.absolutePath
             }
         }
         if (module.launcher) {
             OtaModuleManager.setBundleVersion(module.moduleName, module.moduleVersion)
-            Log.d("CashifyOTA", "$tag::asset bundle ${module.moduleVersion}")
+            OtaLog.d("$tag::asset bundle ${module.moduleVersion}")
             return "assets://${getBundleName()}"
         }
         throw IllegalStateException("$tag::no bundle available for non-launcher module")
@@ -127,72 +131,65 @@ object OtaBundleManager {
         context: Context,
         module: OtaModule,
         onProgress: BundleDownloadProgressListener? = null
-    ) {
+    ): OtaCheckResult {
         val tag = "OtaBundleManager::downloadBundleIfNeeded::${module.moduleName}"
-        Log.d("CashifyOTA", tag)
-        // Registered BEFORE waiting on the mutex so a caller that joins while
-        // another caller's download is in flight still receives that download's
-        // progress.
+        OtaLog.d(tag)
         val listeners = progressListeners.getOrPut(module.moduleName) { CopyOnWriteArraySet() }
         onProgress?.let { listeners.add(it) }
+        var lastEmitAt = 0L
         val fanOutProgress: BundleDownloadProgressListener = { bytesRead, totalBytes, done ->
             listeners.forEach { listener ->
-                try {
-                    listener(bytesRead, totalBytes, done)
-                } catch (e: Exception) {
-                    Log.w("CashifyOTA", "$tag::progress listener failed", e)
-                }
+                try { listener(bytesRead, totalBytes, done) } catch (e: Exception) { OtaLog.w("$tag::progress listener failed", e) }
+            }
+            val now = System.currentTimeMillis()
+            if (done || now - lastEmitAt >= 250L) {
+                lastEmitAt = now
+                OtaEvents.emitProgress(module.moduleName, bytesRead, totalBytes, done)
             }
         }
         try {
             val mutex = downloadMutex.getOrPut(module.moduleName) { Mutex() }
-            if (mutex.isLocked) {
-                Log.d("CashifyOTA", "$tag::download already in flight, waiting for it to finish")
-            }
-            mutex.withLock {
+            if (mutex.isLocked) OtaLog.d("$tag::download already in flight, waiting for it to finish")
+            return mutex.withLock {
                 try {
                     val remoteVersion = OtaRemoteConfig.getBundleLatestVersion(context, module)
-                    Log.d("CashifyOTA", "$tag::remoteVersion: $remoteVersion")
+                    OtaLog.d("$tag::remoteVersion: $remoteVersion")
                     if (remoteVersion.isEmpty()) {
-                        Log.d("CashifyOTA", "$tag::remoteVersion is empty, skip download")
-                        return
+                        OtaLog.d("$tag::remoteVersion is empty, skip download")
+                        return@withLock OtaCheckResult.Skipped("rnb_${module.configKey}_latest_version empty")
                     }
                     if (!remoteVersion.isSemanticVersion()) {
-                        Log.w("CashifyOTA", "$tag::remoteVersion '$remoteVersion' is not a valid version, skip download")
-                        return
+                        OtaLog.w("$tag::remoteVersion '$remoteVersion' is not a valid version, skip download")
+                        return@withLock OtaCheckResult.Skipped("remote version '$remoteVersion' invalid")
                     }
-
                     val assetVersion = getJsBundleAssetVersion(module)
-                    Log.d("CashifyOTA", "$tag::assetVersion: $assetVersion")
-                    if (assetVersion != null &&
-                        listOf(assetVersion, remoteVersion).semanticMax() == assetVersion
-                    ) {
-                        Log.d("CashifyOTA", "$tag::assetVersion >= remoteVersion, skip download")
-                        return
+                    OtaLog.d("$tag::assetVersion: $assetVersion")
+                    if (assetVersion != null && listOf(assetVersion, remoteVersion).semanticMax() == assetVersion) {
+                        OtaLog.d("$tag::assetVersion >= remoteVersion, skip download")
+                        return@withLock OtaCheckResult.UpToDate
                     }
-
                     val diskVersion = getJsBundleDiskVersion(context, module)
-                    if (diskVersion != null &&
-                        listOf(diskVersion, remoteVersion).semanticMax() == diskVersion
-                    ) {
-                        Log.d("CashifyOTA", "$tag::diskVersion $diskVersion >= remoteVersion, skip download")
-                        return
+                    if (diskVersion != null && listOf(diskVersion, remoteVersion).semanticMax() == diskVersion) {
+                        OtaLog.d("$tag::diskVersion $diskVersion >= remoteVersion, skip download")
+                        return@withLock OtaCheckResult.UpToDate
                     }
-
                     val bundleUrl = OtaRemoteConfig.getBundleUrl(context)
                     if (bundleUrl.isEmpty()) {
-                        Log.d("CashifyOTA", "$tag::rn_bundle_url is empty, OTA disabled, skip download")
-                        return
+                        OtaLog.d("$tag::rn_bundle_url is empty, OTA disabled, skip download")
+                        return@withLock OtaCheckResult.Skipped("rn_bundle_url empty")
                     }
-
-                    Log.d("CashifyOTA", "$tag::downloading remote bundle $remoteVersion")
-                    downloadRemoteBundle(context, tag, module, bundleUrl, remoteVersion, fanOutProgress)
+                    OtaLog.d("$tag::downloading remote bundle $remoteVersion")
+                    if (downloadRemoteBundle(context, tag, module, bundleUrl, remoteVersion, fanOutProgress)) {
+                        OtaCheckResult.Downloaded(remoteVersion)
+                    } else {
+                        OtaCheckResult.Failed("bundle $remoteVersion rejected (missing marker or install failed)")
+                    }
                 } catch (e: Exception) {
-                    Log.e("CashifyOTA", "$tag::error: ${e.message}", e)
+                    OtaLog.e("$tag::error: ${e.message}", e)
+                    OtaCheckResult.Failed(e.message ?: e.javaClass.simpleName)
                 }
             }
         } finally {
-            // Runs on every exit path so listeners never leak.
             onProgress?.let { listeners.remove(it) }
         }
     }
@@ -210,13 +207,13 @@ object OtaBundleManager {
         } catch (e: Exception) {
             ""
         }
-        Log.d("CashifyOTA", "$tag::assetVersion: $assetVersion, remoteVersion: $remoteVersion")
+        OtaLog.d("$tag::assetVersion: $assetVersion, remoteVersion: $remoteVersion")
 
         val invalidVersions = mutableListOf<String>()
         for (versionDir in versionDirs) {
             // empty directory
             if (versionDir.listFiles()?.isEmpty() == true) {
-                Log.d("CashifyOTA", "$tag::empty version directory: ${versionDir.name}")
+                OtaLog.d("$tag::empty version directory: ${versionDir.name}")
                 invalidVersions.add(versionDir.name)
                 versionDir.deleteRecursively()
                 continue
@@ -225,7 +222,7 @@ object OtaBundleManager {
             if (remoteVersion.isNotEmpty() && remoteVersion != versionDir.name &&
                 listOf(remoteVersion, versionDir.name).semanticMin() == remoteVersion
             ) {
-                Log.d("CashifyOTA", "$tag::rollback detected, deleting: ${versionDir.name}")
+                OtaLog.d("$tag::rollback detected, deleting: ${versionDir.name}")
                 invalidVersions.add(versionDir.name)
                 versionDir.deleteRecursively()
                 continue
@@ -234,14 +231,14 @@ object OtaBundleManager {
             if (assetVersion != null &&
                 listOf(assetVersion, versionDir.name).semanticMax() == assetVersion
             ) {
-                Log.d("CashifyOTA", "$tag::stale version detected, deleting: ${versionDir.name}")
+                OtaLog.d("$tag::stale version detected, deleting: ${versionDir.name}")
                 invalidVersions.add(versionDir.name)
                 versionDir.deleteRecursively()
                 continue
             }
             val bundleFile = File(versionDir, getBundleName())
             if (!bundleFile.exists() || !BundleDownloader.hasMarker(bundleFile)) {
-                Log.d("CashifyOTA", "$tag::missing/corrupt bundle, deleting: ${versionDir.name}")
+                OtaLog.d("$tag::missing/corrupt bundle, deleting: ${versionDir.name}")
                 invalidVersions.add(versionDir.name)
                 versionDir.deleteRecursively()
                 continue
@@ -254,7 +251,7 @@ object OtaBundleManager {
         val latestVersion = validVersionDirs.map { it.name }.semanticMax()
         for (versionDir in validVersionDirs) {
             if (versionDir.name != latestVersion) {
-                Log.d("CashifyOTA", "$tag::deleting old version directory: ${versionDir.name}")
+                OtaLog.d("$tag::deleting old version directory: ${versionDir.name}")
                 versionDir.deleteRecursively()
             }
         }
@@ -267,9 +264,9 @@ object OtaBundleManager {
         for (tempFile in tempFiles) {
             try {
                 tempFile.delete()
-                Log.d("CashifyOTA", "$tag::deleted temporary file: ${tempFile.absolutePath}")
+                OtaLog.d("$tag::deleted temporary file: ${tempFile.absolutePath}")
             } catch (e: Exception) {
-                Log.e("CashifyOTA", "$tag::failed to delete ${tempFile.absolutePath}: ${e.message}")
+                OtaLog.e("$tag::failed to delete ${tempFile.absolutePath}: ${e.message}")
             }
         }
     }
@@ -279,7 +276,7 @@ object OtaBundleManager {
         val moduleDir = File(getFilesDir(context), module.modulePath)
         if (moduleDir.exists()) {
             val result = moduleDir.deleteRecursively()
-            Log.d("CashifyOTA", "$tag::deleted module directory: ${moduleDir.absolutePath} result: $result")
+            OtaLog.d("$tag::deleted module directory: ${moduleDir.absolutePath} result: $result")
         }
     }
 
@@ -290,7 +287,7 @@ object OtaBundleManager {
         bundleUrl: String,
         remoteVersion: String,
         onProgress: BundleDownloadProgressListener? = null
-    ) {
+    ): Boolean {
         val destinationFile = buildJsBundleFilePath(context, module, remoteVersion)
         val tempFile = File(getTemporaryDir(context), UUID.randomUUID().toString() + ".tmp")
         val remoteUrl = buildJsBundleRemoteUrl(bundleUrl, module, remoteVersion)
@@ -302,9 +299,9 @@ object OtaBundleManager {
         }
 
         if (!BundleDownloader.hasMarker(tempFile)) {
-            Log.d("CashifyOTA", "$tag::downloaded bundle has no marker, deleting")
+            OtaLog.d("$tag::downloaded bundle has no marker, deleting")
             tempFile.delete()
-            return
+            return false
         }
 
         try {
@@ -312,22 +309,60 @@ object OtaBundleManager {
             // cacheDir and filesDir share a filesystem, so this rename is atomic.
             val renamed = tempFile.renameTo(destinationFile)
             if (!renamed) {
-                Log.e("CashifyOTA", "$tag::renameTo failed, cleaning up")
+                OtaLog.e("$tag::renameTo failed, cleaning up")
                 tempFile.delete()
                 if (destinationFile.exists()) destinationFile.delete()
-                return
+                return false
             }
-            Log.d("CashifyOTA", "$tag::bundle installed at: ${destinationFile.absolutePath}")
+            OtaLog.d("$tag::bundle installed at: ${destinationFile.absolutePath}")
+            return true
         } catch (e: Exception) {
-            Log.e("CashifyOTA", "$tag::error moving file: ${e.message}")
+            OtaLog.e("$tag::error moving file: ${e.message}")
             tempFile.delete()
             if (destinationFile.exists()) destinationFile.delete()
+            return false
         }
     }
 
-    private fun buildJsBundleRemoteUrl(bundleUrl: String, module: OtaModule, version: String): String {
+    internal fun buildJsBundleRemoteUrl(bundleUrl: String, module: OtaModule, version: String): String {
         return "${bundleUrl.trimEnd('/')}/${module.modulePath}/$version/${getBundleName()}.zip".also {
-            Log.d("CashifyOTA", "OtaBundleManager::buildJsBundleRemoteUrl::url: $it")
+            OtaLog.d("OtaBundleManager::buildJsBundleRemoteUrl::url: $it")
+        }
+    }
+
+    /** Every version directory on disk for the module, valid or not, newest first. */
+    internal fun listBundles(context: Context, module: OtaModule): List<OtaBundleInfo> {
+        val moduleDir = File(getFilesDir(context), module.modulePath)
+        val dirs = moduleDir.listFiles()?.filter { it.isDirectory } ?: return emptyList()
+        return dirs.map { dir ->
+            val file = File(dir, getBundleName())
+            OtaBundleInfo(
+                version = dir.name,
+                path = file.absolutePath,
+                sizeBytes = if (file.exists()) file.length() else 0L,
+                valid = file.exists() && BundleDownloader.hasMarker(file),
+                modifiedAt = if (file.exists()) file.lastModified() else dir.lastModified(),
+            )
+        }.sortedWith { a, b -> compareVersionsDesc(a.version, b.version) }
+    }
+
+    /** True when `version` is exactly what the next launch would boot (mirrors getLauncherBundleFilePathLocal). */
+    internal fun willBootNextLaunch(context: Context, module: OtaModule, version: String): Boolean {
+        if (!module.launcher) return false
+        if (OtaPreferences.isSafeModeEnabled(context) || OtaPreferences.isLocalSafeModeEnabled(context) ||
+            OtaPreferences.isModuleSafeModeEnabled(context, module.configKey)) return false
+        val diskVersion = getJsBundleDiskVersion(context, module) ?: return false
+        if (diskVersion != version) return false
+        val assetVersion = getJsBundleAssetVersion(module) ?: return true
+        return listOf(diskVersion, assetVersion).semanticMax() == diskVersion && diskVersion != assetVersion
+    }
+
+    private fun compareVersionsDesc(a: String, b: String): Int {
+        val max = listOf(a, b).semanticMax()
+        return when {
+            a == b -> 0
+            max == a -> -1
+            else -> 1
         }
     }
 
@@ -340,7 +375,7 @@ object OtaBundleManager {
         return if (module.launcher) module.moduleVersion else null
     }
 
-    private fun getJsBundleDiskVersion(context: Context, module: OtaModule): String? {
+    internal fun getJsBundleDiskVersion(context: Context, module: OtaModule): String? {
         return try {
             val versionFolders = File(getFilesDir(context), module.modulePath).list()
             val validVersions = versionFolders?.filter { version ->
@@ -349,7 +384,7 @@ object OtaBundleManager {
             } ?: emptyList()
             validVersions.semanticMax()
         } catch (e: Exception) {
-            Log.e("CashifyOTA", "OtaBundleManager::getJsBundleDiskVersion error: ${e.message}")
+            OtaLog.e("OtaBundleManager::getJsBundleDiskVersion error: ${e.message}")
             null
         }
     }

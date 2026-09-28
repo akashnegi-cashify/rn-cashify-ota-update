@@ -1,6 +1,5 @@
 package `in`.cashify.otaupdate
 
-import android.util.Log
 import androidx.annotation.WorkerThread
 import okhttp3.MediaType
 import okhttp3.OkHttpClient
@@ -50,8 +49,8 @@ object BundleDownloader {
         val timeout: Long = 120000 // 2 minutes
         val client = OkHttpClient().newBuilder().callTimeout(timeout, TimeUnit.MILLISECONDS).build()
         val request = Request.Builder().url(bundleUrl).build()
-        Log.d("CashifyOTA", "BundleDownloader::downloadFile::bundleUrl: $bundleUrl")
-        Log.d("CashifyOTA", "BundleDownloader::downloadFile::bundlePath: ${bundleFile.absolutePath}")
+        OtaLog.d("BundleDownloader::downloadFile::bundleUrl: $bundleUrl")
+        OtaLog.d("BundleDownloader::downloadFile::bundlePath: ${bundleFile.absolutePath}")
         try {
             client.newCall(request).execute().use { response ->
                 require(response.isSuccessful) { "Failed to download bundle: $bundleUrl (HTTP ${response.code})" }
@@ -67,13 +66,13 @@ object BundleDownloader {
         } catch (e: Exception) {
             // delete the file if download fails
             bundleFile.delete()
-            Log.d("CashifyOTA", "BundleDownloader::downloadFile error: ${e.message}")
+            OtaLog.d("BundleDownloader::downloadFile error: ${e.message}")
         }
         return null
     }
 
     private fun writeToFileSync(bundleFile: File, source: Source): String {
-        Log.d("CashifyOTA", "BundleDownloader::writeToFile::FilePath: ${bundleFile.absolutePath}")
+        OtaLog.d("BundleDownloader::writeToFile::FilePath: ${bundleFile.absolutePath}")
         val startTime = System.currentTimeMillis()
 
         val parentDir = bundleFile.parentFile
@@ -97,9 +96,9 @@ object BundleDownloader {
             }
         }
 
-        Log.d("CashifyOTA", "BundleDownloader::writeToFile::Time: ${System.currentTimeMillis() - startTime}ms")
-        Log.d("CashifyOTA", "BundleDownloader::writeToFile::Size: ${prettyPrintBytes(bundleFile.length())}")
-        Log.d("CashifyOTA", "BundleDownloader::writeToFile::Path: ${bundleFile.absolutePath}")
+        OtaLog.d("BundleDownloader::writeToFile::Time: ${System.currentTimeMillis() - startTime}ms")
+        OtaLog.d("BundleDownloader::writeToFile::Size: ${prettyPrintBytes(bundleFile.length())}")
+        OtaLog.d("BundleDownloader::writeToFile::Path: ${bundleFile.absolutePath}")
         return bundleFile.absolutePath
     }
 

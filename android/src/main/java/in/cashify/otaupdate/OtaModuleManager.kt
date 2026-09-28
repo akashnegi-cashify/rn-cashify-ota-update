@@ -1,10 +1,11 @@
 package `in`.cashify.otaupdate
 
 import android.content.Context
-import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
@@ -25,6 +26,12 @@ object OtaModuleManager {
     // Thread-safe map of the bundle version actually resolved per module.
     private val bundleVersionMap = ConcurrentHashMap<String, String>()
 
+    private val checkMutex = Mutex()
+
+    @Volatile
+    var checkInFlight: Boolean = false
+        private set
+
     /**
      * Synchronous, local-only app.json parse — safe to call on the launch path.
      * Never throws; on any failure the module map stays empty and OTA is disabled.
@@ -37,7 +44,7 @@ object OtaModuleManager {
             val root = JSONObject(jsonString)
             val modulesJson = root.optJSONObject("otaModules") ?: root.optJSONObject("legoModules")
             if (modulesJson == null) {
-                Log.w("CashifyOTA", "OtaModuleManager::init::no otaModules/legoModules in $assetFileName, OTA disabled")
+                OtaLog.w("OtaModuleManager::init::no otaModules/legoModules in $assetFileName, OTA disabled")
                 initialized = true
                 return
             }
@@ -57,73 +64,79 @@ object OtaModuleManager {
             }
             modules = parsed.toMap()
             initialized = true
-            Log.d("CashifyOTA", "OtaModuleManager::init::modules: ${modules.keys.joinToString(",")}")
+            OtaLog.d("OtaModuleManager::init::modules: ${modules.keys.joinToString(",")}")
         } catch (t: Throwable) {
-            Log.e("CashifyOTA", "OtaModuleManager::init failed, OTA disabled: ${t.message}", t)
+            OtaLog.e("OtaModuleManager::init failed, OTA disabled: ${t.message}", t)
             modules = emptyMap()
             initialized = true
         }
     }
 
-    /**
-     * Fire-and-forget background check: temp cleanup -> Remote Config -> global
-     * then per-module safe-mode kill switches -> per-module download-if-needed +
-     * stale/rollback cleanup. Downloaded bundles are picked up on the NEXT launch.
-     */
     fun loadBundlesAsync(context: Context) {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                init(context)
-                val otaModules = modules.values.filter { it.otaUpdates }
-                if (otaModules.isEmpty()) {
-                    Log.d("CashifyOTA", "OtaModuleManager::no OTA modules configured, skipping")
-                    return@launch
-                }
+        CoroutineScope(Dispatchers.IO).launch { loadBundles(context) }
+    }
 
-                OtaBundleManager.cleanupTemporaryBundles(context)
-
-                if (!NetworkUtil.isNetworkAvailable(context)) {
-                    Log.d("CashifyOTA", "OtaModuleManager::network not available, skipping bundle check")
-                    return@launch
-                }
-
-                // Global kill switch: wipes EVERY module and stops the whole check.
-                if (OtaRemoteConfig.getEnableSafeMode(context)) {
-                    Log.d("CashifyOTA", "OtaModuleManager::global safe mode enabled, clearing all module bundles")
-                    otaModules.forEach { OtaBundleManager.cleanupModuleBundles(context, it) }
-                    // Persisted locally so the NEXT launch stays on the asset bundle
-                    // even when offline.
-                    OtaPreferences.setSafeModeEnabled(context, true)
-                    return@launch
-                }
-                OtaPreferences.setSafeModeEnabled(context, false)
-
-                val sortedModules =
-                    otaModules.sortedWith(compareBy({ it.bundlePriority }, { it.moduleName }))
-                sortedModules.forEach { module ->
-                    // Per-module kill switch: wipes ONLY this module; others continue.
-                    if (OtaRemoteConfig.getModuleEnableSafeMode(context, module)) {
-                        Log.d(
-                            "CashifyOTA",
-                            "OtaModuleManager::module safe mode enabled for ${module.moduleName}, clearing its bundles"
-                        )
-                        OtaBundleManager.cleanupModuleBundles(context, module)
-                        OtaPreferences.setModuleSafeModeEnabled(context, module.configKey, true)
-                        return@forEach
-                    }
-                    OtaPreferences.setModuleSafeModeEnabled(context, module.configKey, false)
-
-                    Log.d(
-                        "CashifyOTA",
-                        "OtaModuleManager::checking module: ${module.moduleName}, priority: ${module.bundlePriority}"
-                    )
-                    OtaBundleManager.downloadBundleIfNeeded(context, module)
-                    OtaBundleManager.cleanupStaleBundles(context, module)
-                }
-            } catch (t: Throwable) {
-                Log.e("CashifyOTA", "OtaModuleManager::loadBundlesAsync failed: ${t.message}", t)
-            }
+    /**
+     * One full check. Serialised: a second caller waits for the first and returns its own
+     * (fresh) pass afterwards. Records `last_check_at` / `last_check_result` on every exit.
+     * @param forceFetch bypass the Remote Config cache first (debug "Check now").
+     * @return human-readable summary, e.g. "CashifyOps: downloaded 8.2.0".
+     */
+    suspend fun loadBundles(context: Context, forceFetch: Boolean = false): String = checkMutex.withLock {
+        checkInFlight = true
+        val summary = try {
+            runCheck(context, forceFetch)
+        } catch (t: Throwable) {
+            OtaLog.e("OtaModuleManager::loadBundles failed: ${t.message}", t)
+            "error: ${t.message ?: t.javaClass.simpleName}"
+        } finally {
+            checkInFlight = false
         }
+        OtaPreferences.setLastCheck(context, System.currentTimeMillis(), summary)
+        OtaLog.d("OtaModuleManager::check result: $summary")
+        summary
+    }
+
+    private suspend fun runCheck(context: Context, forceFetch: Boolean): String {
+        init(context)
+        val otaModules = modules.values.filter { it.otaUpdates }
+        if (otaModules.isEmpty()) {
+            OtaLog.d("OtaModuleManager::no OTA modules configured, skipping")
+            return "skipped: no OTA modules configured"
+        }
+        OtaBundleManager.cleanupTemporaryBundles(context)
+        if (!NetworkUtil.isNetworkAvailable(context)) {
+            OtaLog.d("OtaModuleManager::network not available, skipping bundle check")
+            return "skipped: network not available"
+        }
+        if (forceFetch && !OtaRemoteConfig.refresh(context)) {
+            OtaLog.w("OtaModuleManager::forced Remote Config refresh failed, using cached values")
+        }
+        if (OtaRemoteConfig.getEnableSafeMode(context)) {
+            OtaLog.d("OtaModuleManager::global safe mode enabled, clearing all module bundles")
+            otaModules.forEach { OtaBundleManager.cleanupModuleBundles(context, it) }
+            OtaPreferences.setSafeModeEnabled(context, true)
+            return "skipped: global safe mode enabled"
+        }
+        OtaPreferences.setSafeModeEnabled(context, false)
+
+        val results = mutableListOf<String>()
+        val sortedModules = otaModules.sortedWith(compareBy({ it.bundlePriority }, { it.moduleName }))
+        sortedModules.forEach { module ->
+            if (OtaRemoteConfig.getModuleEnableSafeMode(context, module)) {
+                OtaLog.d("OtaModuleManager::module safe mode enabled for ${module.moduleName}, clearing its bundles")
+                OtaBundleManager.cleanupModuleBundles(context, module)
+                OtaPreferences.setModuleSafeModeEnabled(context, module.configKey, true)
+                results += "${module.moduleName}: skipped: module safe mode enabled"
+                return@forEach
+            }
+            OtaPreferences.setModuleSafeModeEnabled(context, module.configKey, false)
+            OtaLog.d("OtaModuleManager::checking module: ${module.moduleName}, priority: ${module.bundlePriority}")
+            val result = OtaBundleManager.downloadBundleIfNeeded(context, module)
+            OtaBundleManager.cleanupStaleBundles(context, module)
+            results += "${module.moduleName}: ${result.describe()}"
+        }
+        return results.joinToString("; ")
     }
 
     fun launcherModule(): OtaModule? = modules.values.firstOrNull { it.launcher }

@@ -26,6 +26,7 @@ object CashifyOtaUpdate {
 
     /** Synchronous, local-only app.json parse — safe on the launch path. */
     fun init(context: Context) {
+        OtaLog.init(context)
         OtaModuleManager.init(context)
     }
 

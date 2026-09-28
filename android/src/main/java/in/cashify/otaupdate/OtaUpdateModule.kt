@@ -1,7 +1,6 @@
 package `in`.cashify.otaupdate
 
 import android.content.Context
-import android.util.Log
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -22,6 +21,22 @@ import java.io.FileNotFoundException
 class OtaUpdateModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
+    init {
+        OtaEvents.attach(reactContext)
+    }
+
+    override fun invalidate() {
+        OtaEvents.detach(reactContext)
+        super.invalidate()
+    }
+
+    /** Required by NativeEventEmitter on iOS parity; no-op on Android. */
+    @ReactMethod
+    fun addListener(eventName: String) = Unit
+
+    @ReactMethod
+    fun removeListeners(count: Int) = Unit
+
     override fun getName(): String = NAME
 
     /**
@@ -37,7 +52,7 @@ class OtaUpdateModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun getFileSystemURL(moduleName: String, promise: Promise) {
         CoroutineScope(Dispatchers.IO).launch {
-            Log.d("CashifyOTA", "OtaUpdateModule::getFileSystemURL::$moduleName")
+            OtaLog.d("OtaUpdateModule::getFileSystemURL::$moduleName")
             try {
                 val appContext = reactContext.applicationContext
                 var jsBundleUri = OtaBundleManager.getJsBundleUriForModule(appContext, moduleName)
@@ -58,7 +73,7 @@ class OtaUpdateModule(private val reactContext: ReactApplicationContext) :
             } catch (fnf: FileNotFoundException) {
                 promise.reject(NAME, fnf.message, fnf)
             } catch (e: Exception) {
-                Log.e("CashifyOTA", "OtaUpdateModule::getFileSystemURL error", e)
+                OtaLog.e("OtaUpdateModule::getFileSystemURL error", e)
                 promise.reject(NAME, "Error getting file system URL", e)
             }
         }

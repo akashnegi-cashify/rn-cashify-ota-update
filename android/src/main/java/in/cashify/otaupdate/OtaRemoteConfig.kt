@@ -1,7 +1,6 @@
 package `in`.cashify.otaupdate
 
 import android.content.Context
-import android.util.Log
 import com.google.firebase.Firebase
 import com.google.firebase.remoteconfig.FirebaseRemoteConfig
 import com.google.firebase.remoteconfig.remoteConfig
@@ -32,8 +31,7 @@ object OtaRemoteConfig {
     private suspend fun fetchRemoteConfig(context: Context): Boolean {
         return mutex.withLock {
             if (isConfigFetched || fetchTried) return true.also {
-                Log.d(
-                    "CashifyOTA",
+                OtaLog.d(
                     "OtaRemoteConfig::Config already fetched: $isConfigFetched, fetchTried: $fetchTried"
                 )
             }
@@ -41,12 +39,12 @@ object OtaRemoteConfig {
             // Try with a 2s budget; on failure/timeout, retry once with 5s.
             var success = attemptFetch(context, 2000)
             if (!success) {
-                Log.d("CashifyOTA", "OtaRemoteConfig::Fetch failed/timed out, retrying with 5s timeout")
+                OtaLog.d("OtaRemoteConfig::Fetch failed/timed out, retrying with 5s timeout")
                 success = attemptFetch(context, 5000)
             }
             if (!success) {
                 fetchTried = true
-                Log.d("CashifyOTA", "OtaRemoteConfig::Fetch failed after retry")
+                OtaLog.d("OtaRemoteConfig::Fetch failed after retry")
             }
             success
         }
@@ -61,7 +59,7 @@ object OtaRemoteConfig {
         try {
             remoteConfig.setConfigSettingsAsync(configSettings).await()
         } catch (e: Exception) {
-            Log.e("CashifyOTA", "OtaRemoteConfig::setConfigSettings failed: ${e.message}")
+            OtaLog.e("OtaRemoteConfig::setConfigSettings failed: ${e.message}")
         }
         settingsApplied = true
     }
@@ -73,21 +71,21 @@ object OtaRemoteConfig {
             try {
                 val forceFetch = shouldForceFetch(context)
                 val updated = if (forceFetch) {
-                    Log.d("CashifyOTA", "OtaRemoteConfig::Forced fetch")
+                    OtaLog.d("OtaRemoteConfig::Forced fetch")
                     remoteConfig.fetch(0).await()
                     remoteConfig.activate().await()
                 } else {
-                    Log.d("CashifyOTA", "OtaRemoteConfig::Fetch")
+                    OtaLog.d("OtaRemoteConfig::Fetch")
                     remoteConfig.fetchAndActivate().await()
                 }
-                Log.d("CashifyOTA", "OtaRemoteConfig::Config params updated: $updated")
+                OtaLog.d("OtaRemoteConfig::Config params updated: $updated")
                 isConfigFetched = true
                 if (forceFetch) {
                     OtaPreferences.setStoredAppVersion(context, HostAppInfo.versionName(context))
                 }
                 true
             } catch (e: Exception) {
-                Log.e("CashifyOTA", "OtaRemoteConfig::Fetch failed ${e.message}")
+                OtaLog.e("OtaRemoteConfig::Fetch failed ${e.message}")
                 false
             }
         } ?: false
@@ -100,7 +98,7 @@ object OtaRemoteConfig {
         val storedVersion = OtaPreferences.getStoredAppVersion(context)
         val currentVersion = HostAppInfo.versionName(context)
         return if (storedVersion != currentVersion) {
-            Log.d("CashifyOTA", "OtaRemoteConfig::App version changed $storedVersion -> $currentVersion, forcing fetch")
+            OtaLog.d("OtaRemoteConfig::App version changed $storedVersion -> $currentVersion, forcing fetch")
             true
         } else {
             false
@@ -126,4 +124,38 @@ object OtaRemoteConfig {
         fetchRemoteConfig(context)
         return Firebase.remoteConfig.getString("rnb_${module.configKey}_latest_version")
     }
+
+    /** Bypasses the 300 s cache: fetch(0)+activate with a 5 s budget. Used by the debug screen's "Check now". */
+    suspend fun refresh(context: Context): Boolean = mutex.withLock {
+        applySettingsOnce()
+        val ok = withTimeoutOrNull(5000) {
+            try {
+                val remoteConfig = Firebase.remoteConfig
+                remoteConfig.fetch(0).await()
+                remoteConfig.activate().await()
+                true
+            } catch (e: Exception) {
+                OtaLog.e("OtaRemoteConfig::refresh failed ${e.message}")
+                false
+            }
+        } ?: false
+        OtaLog.d("OtaRemoteConfig::refresh ok=$ok")
+        if (ok) { isConfigFetched = true; fetchTried = false }
+        else fetchTried = true
+        ok
+    }
+
+    /** Activated value without triggering a fetch (debug snapshot). */
+    fun cachedString(key: String): String = Firebase.remoteConfig.getString(key)
+    fun cachedBoolean(key: String): Boolean = Firebase.remoteConfig.getBoolean(key)
+
+    fun lastFetchStatus(): String = when (Firebase.remoteConfig.info.lastFetchStatus) {
+        FirebaseRemoteConfig.LAST_FETCH_STATUS_SUCCESS -> "success"
+        FirebaseRemoteConfig.LAST_FETCH_STATUS_FAILURE -> "failure"
+        FirebaseRemoteConfig.LAST_FETCH_STATUS_THROTTLED -> "throttled"
+        else -> "no_fetch_yet"
+    }
+
+    /** Epoch ms of the last successful fetch, or null. */
+    fun lastFetchTimeMillis(): Long? = Firebase.remoteConfig.info.fetchTimeMillis.takeIf { it > 0 }
 }
