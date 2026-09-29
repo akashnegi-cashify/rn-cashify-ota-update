@@ -107,10 +107,23 @@ Publish **both platforms before bumping the RC key** (the key is shared).
 ## JS API
 
 ```ts
-import {getOtaBundleVersion, getFileSystemURL, isOtaUpdateAvailable} from 'rn-cashify-ota-update';
+import {
+  getOtaBundleVersion, getFileSystemURL, isOtaUpdateAvailable,
+  getOtaStatus, getOtaLogs, clearOtaLogs, checkForUpdates,
+  deleteDownloadedBundles, setLocalSafeMode, addOtaListener,
+} from 'rn-cashify-ota-update';
 
-getOtaBundleVersion();          // "8.0.1" (OTA) or the app versionName (asset)
-await getFileSystemURL('MyApp'); // file:// URL of a module's active bundle
+getOtaBundleVersion();            // "8.0.1" (OTA) or the app versionName (asset)
+await getFileSystemURL('MyApp');  // file:// URL of a module's active bundle
+
+// Debug API (build an "OTA Status" screen with these)
+const status = await getOtaStatus();   // versions, cached RC keys, disk bundles, last check
+const logs = await getOtaLogs();       // last 300 CashifyOTA lines, persisted across launches
+const summary = await checkForUpdates(); // forced RC refresh + full check, e.g. "MyApp: downloaded 8.2.0"
+await deleteDownloadedBundles();       // next launch boots the shipped asset
+await setLocalSafeMode(true);          // pin next launch to the shipped asset (debug override; RC never clears it)
+const off = addOtaListener('CashifyOtaLog', (e) => console.log(e.level, e.message));
+addOtaListener('CashifyOtaProgress', (p) => console.log(p.bytesRead, p.totalBytes, p.done)); // iOS: start + done only
 ```
 
 ## Debugging
@@ -120,3 +133,10 @@ Both platforms log with tag **`CashifyOTA`**:
 Debug builds always use Metro and skip OTA entirely.
 Remote Config is cached 300s — expect up to ~5 min propagation (+1 launch);
 debuggable builds and the first launch after an app update force-fetch.
+Logs are also captured in a 300-line ring buffer persisted at
+`<filesDir>/cashify_ota/logs.jsonl` (Android) / `Application Support/cashify_ota/logs.jsonl`
+(iOS) and exposed through `getOtaLogs()`.
+iOS emits `CashifyOtaProgress` only at download start (`bytesRead: 0, totalBytes: -1, done: false`)
+and end (`done: true`) because its downloader does not stream, while Android streams real byte
+counts throttled to ~250 ms. iOS has no offline pre-check — an offline check reports `error: …`
+where Android reports `skipped: network not available`.

@@ -121,6 +121,7 @@ class MyShopApp : Application(), ReactApplication {
 
   override val reactHost: ReactHost by lazy {
     CashifyOtaUpdate.init(applicationContext)
+    // init also loads the persisted OTA log tail (tiny file, synchronous).
     getDefaultReactHost(
       context = applicationContext,
       packageList = PackageList(this).packages,
@@ -151,6 +152,7 @@ import CashifyOtaUpdate
 // in didFinishLaunchingWithOptions, AFTER FirebaseApp.configure(),
 // BEFORE startReactNative:
 OtaModuleManager.shared.initModules()
+// initModules also loads the persisted OTA log tail (tiny file, synchronous).
 
 // AFTER startReactNative:
 OtaModuleManager.shared.loadBundlesAsync()
