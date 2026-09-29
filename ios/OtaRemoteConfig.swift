@@ -57,6 +57,15 @@ actor OtaRemoteConfigManager {
     }
   }
 
+  /// Bypasses the 300 s cache with a 5 s budget. Debug "Check now" only.
+  func refresh() async -> Bool {
+    applySettingsOnce()
+    let ok = await fetchRemoteConfig(forceFetch: true, timeoutSeconds: 5)
+    Log.d("OtaRemoteConfig::refresh ok=\(ok)")
+    if ok { isConfigFetched = true; fetchTried = false } else { fetchTried = true }
+    return ok
+  }
+
   private func applySettingsOnce() {
     guard !settingsApplied else { return }
     let remoteConfig = RemoteConfig.remoteConfig()
@@ -134,5 +143,31 @@ enum OtaRemoteConfig {
 
   static func getBundleLatestVersion(module: OtaModule) async -> String {
     await getString("rnb_\(module.configKey)_latest_version")
+  }
+
+  // MARK: - Debug screen
+
+  static func refresh() async -> Bool { await manager.refresh() }
+
+  /// Currently activated value, no fetch.
+  static func cachedString(_ key: String) -> String {
+    RemoteConfig.remoteConfig().configValue(forKey: key).stringValue ?? ""
+  }
+
+  static func cachedBoolean(_ key: String) -> Bool {
+    RemoteConfig.remoteConfig().configValue(forKey: key).boolValue
+  }
+
+  static func lastFetchStatus() -> String {
+    switch RemoteConfig.remoteConfig().lastFetchStatus {
+    case .success: return "success"
+    case .failure: return "failure"
+    case .throttled: return "throttled"
+    default: return "no_fetch_yet"
+    }
+  }
+
+  static func lastFetchTimeMillis() -> Int64? {
+    RemoteConfig.remoteConfig().lastFetchTime.map { Int64($0.timeIntervalSince1970 * 1000) }
   }
 }

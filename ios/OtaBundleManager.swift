@@ -38,6 +38,10 @@ import Foundation
       Log.d("\(tag)::safe mode enabled, using asset bundle")
       return nil
     }
+    if OtaPreferences.isLocalSafeModeEnabled {
+      Log.d("\(tag)::local safe-mode override enabled, using asset bundle")
+      return nil
+    }
     guard let module = OtaModuleManager.shared.launcherModule() else {
       Log.d("\(tag)::no launcher module configured, using asset bundle")
       return nil
@@ -92,6 +96,7 @@ import Foundation
     }
 
     let safeMode = OtaPreferences.isSafeModeEnabled
+      || OtaPreferences.isLocalSafeModeEnabled
       || OtaPreferences.isModuleSafeModeEnabled(module.configKey)
     if !safeMode,
        let diskVersion = getJsBundleDiskVersion(module: module) {
@@ -114,42 +119,50 @@ import Foundation
 
   // MARK: - Background path
 
-  static func downloadBundleIfNeeded(module: OtaModule) async {
+  static func downloadBundleIfNeeded(module: OtaModule) async -> OtaCheckResult {
     let tag = "OtaBundleManager::downloadBundleIfNeeded::\(module.moduleName)"
     do {
       let remoteVersion = await OtaRemoteConfig.getBundleLatestVersion(module: module)
       Log.d("\(tag)::remoteVersion: \(remoteVersion)")
       if remoteVersion.isEmpty {
         Log.d("\(tag)::remoteVersion is empty, skip download")
-        return
+        return .skipped("rnb_\(module.configKey)_latest_version empty")
       }
       if !remoteVersion.isSemanticVersion {
         Log.e("\(tag)::remoteVersion '\(remoteVersion)' is not a valid version, skip download")
-        return
+        return .skipped("remote version '\(remoteVersion)' invalid")
       }
 
       let assetVersion = getJsBundleAssetVersion(module: module)
       if let assetVersion, [assetVersion, remoteVersion].semanticMax() == assetVersion {
         Log.d("\(tag)::assetVersion \(assetVersion) >= remoteVersion, skip download")
-        return
+        return .upToDate
       }
 
       if let diskVersion = getJsBundleDiskVersion(module: module),
          [diskVersion, remoteVersion].semanticMax() == diskVersion {
         Log.d("\(tag)::diskVersion \(diskVersion) >= remoteVersion, skip download")
-        return
+        return .upToDate
       }
 
       let bundleUrl = await OtaRemoteConfig.getBundleUrl()
       guard !bundleUrl.isEmpty else {
         Log.d("\(tag)::rn_bundle_url is empty, OTA disabled, skip download")
-        return
+        return .skipped("rn_bundle_url empty")
       }
 
       Log.d("\(tag)::downloading remote bundle \(remoteVersion)")
-      try await downloadRemoteBundle(module: module, bundleUrl: bundleUrl, remoteVersion: remoteVersion)
+      // URLSession.data(for:) does not stream, so progress is start + done only.
+      OtaEvents.emitProgress(moduleName: module.moduleName, bytesRead: 0, totalBytes: -1, done: false)
+      let installed = try await downloadRemoteBundle(module: module, bundleUrl: bundleUrl, remoteVersion: remoteVersion)
+      OtaEvents.emitProgress(moduleName: module.moduleName, bytesRead: 0, totalBytes: -1, done: true)
+      return installed
+        ? .downloaded(remoteVersion)
+        : .failed("bundle \(remoteVersion) rejected (missing marker or install failed)")
     } catch {
+      OtaEvents.emitProgress(moduleName: module.moduleName, bytesRead: 0, totalBytes: -1, done: true)
       Log.e("\(tag)::error: \(error.localizedDescription)")
+      return .failed(otaMessage(error))
     }
   }
 
@@ -256,7 +269,7 @@ import Foundation
     module: OtaModule,
     bundleUrl: String,
     remoteVersion: String
-  ) async throws {
+  ) async throws -> Bool {
     let tag = "OtaBundleManager::downloadRemoteBundle::\(module.moduleName)"
     let fileManager = FileManager.default
     let destinationFile = try buildJsBundleFilePath(modulePath: module.modulePath, version: remoteVersion)
@@ -275,7 +288,7 @@ import Foundation
     guard BundleDownloader.hasMarker(filePath: tempFile.path) else {
       Log.d("\(tag)::downloaded bundle has no marker, deleting")
       try? fileManager.removeItem(at: tempFile)
-      return
+      return false
     }
 
     do {
@@ -290,10 +303,12 @@ import Foundation
         try fileManager.moveItem(at: tempFile, to: destinationFile)
       }
       Log.d("\(tag)::bundle installed at: \(destinationFile.path)")
+      return true
     } catch {
       Log.e("\(tag)::error installing bundle: \(error.localizedDescription)")
       try? fileManager.removeItem(at: tempFile)
       try? fileManager.removeItem(at: destinationFile)
+      return false
     }
   }
 
@@ -324,6 +339,53 @@ import Foundation
       }
     return validVersions.semanticMax()
   }
+
+  // MARK: - Debug-screen helpers
+
+  /// Every version directory on disk for `module`, newest first.
+  static func listBundles(module: OtaModule) -> [OtaBundleInfo] {
+    let fm = FileManager.default
+    guard let moduleDir = try? getFilesDir(modulePath: module.modulePath),
+          let dirs = try? fm.contentsOfDirectory(
+            at: moduleDir, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles) else {
+      return []
+    }
+    return dirs
+      .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+      .map { dir -> OtaBundleInfo in
+        let file = dir.appendingPathComponent(getBundleName())
+        let attrs = try? fm.attributesOfItem(atPath: file.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        // Missing bundle file -> fall back to the version directory's mtime (Android: dir.lastModified()).
+        let dirModified = (try? fm.attributesOfItem(atPath: dir.path))?[.modificationDate] as? Date
+        let modified = ((attrs?[.modificationDate] as? Date) ?? dirModified ?? Date(timeIntervalSince1970: 0))
+          .timeIntervalSince1970
+        return OtaBundleInfo(
+          version: dir.lastPathComponent,
+          path: file.path,
+          sizeBytes: size,
+          valid: fm.fileExists(atPath: file.path) && BundleDownloader.hasMarker(filePath: file.path),
+          modifiedAt: Int64(modified * 1000))
+      }
+      .sorted { [$0.version, $1.version].semanticMax() == $0.version && $0.version != $1.version }
+  }
+
+  /// Whether the launch path would boot `version` from disk on the next launch.
+  static func willBootNextLaunch(module: OtaModule, version: String) -> Bool {
+    if isDebugMode() { return false }
+    guard module.launcher else { return false }
+    if OtaPreferences.isSafeModeEnabled || OtaPreferences.isLocalSafeModeEnabled
+        || OtaPreferences.isModuleSafeModeEnabled(module.configKey) { return false }
+    guard let diskVersion = getJsBundleDiskVersion(module: module), diskVersion == version else { return false }
+    guard let assetVersion = getJsBundleAssetVersion(module: module) else { return true }
+    return [diskVersion, assetVersion].semanticMax() == diskVersion && diskVersion != assetVersion
+  }
+
+  static func resolvedDownloadUrl(bundleUrl: String, module: OtaModule, version: String) -> String? {
+    buildJsBundleRemoteUrl(bundleUrl: bundleUrl, module: module, version: version)?.absoluteString
+  }
+
+  static var bootedFromDisk: Bool { loadedBundleVersion != nil }
 
   private static func buildJsBundleRemoteUrl(bundleUrl: String, module: OtaModule, version: String) -> URL? {
     let base = bundleUrl.hasSuffix("/") ? String(bundleUrl.dropLast()) : bundleUrl
@@ -366,4 +428,18 @@ enum OtaBundleManagerError: Error {
   case invalidModule(reason: String)
   case invalidBundle(reason: String)
   case downloadFailed(reason: String)
+}
+
+/// Human-readable message for check results: the `reason` of our own errors
+/// (whose `localizedDescription` is Cocoa's generic text), else `localizedDescription`.
+/// Deliberately not `LocalizedError` so existing `Log.e` Console text is unchanged.
+func otaMessage(_ error: Error) -> String {
+  switch error {
+  case OtaBundleManagerError.invalidModule(let reason),
+       OtaBundleManagerError.invalidBundle(let reason),
+       OtaBundleManagerError.downloadFailed(let reason):
+    return reason
+  default:
+    return error.localizedDescription
+  }
 }

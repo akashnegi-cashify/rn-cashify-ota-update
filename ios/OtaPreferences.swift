@@ -8,6 +8,9 @@ enum OtaPreferences {
   private static let appVersionKey = "ota_app_version"
   // Prefixed so a module configKey can never collide with the global key.
   private static let moduleSafeModePrefix = "module_safe_mode_"
+  private static let localSafeModeKey = "ota_local_safe_mode_override"
+  private static let lastCheckAtKey = "ota_last_check_at"
+  private static let lastCheckResultKey = "ota_last_check_result"
 
   static var isSafeModeEnabled: Bool {
     UserDefaults.standard.bool(forKey: safeModeKey)
@@ -31,5 +34,27 @@ enum OtaPreferences {
 
   static func setStoredAppVersion(_ version: String) {
     UserDefaults.standard.set(version, forKey: appVersionKey)
+  }
+
+  /// Debug-screen override: NEVER written by the Remote Config path. Launch path only.
+  static var isLocalSafeModeEnabled: Bool {
+    UserDefaults.standard.bool(forKey: localSafeModeKey)
+  }
+
+  static func setLocalSafeModeEnabled(_ enabled: Bool) {
+    UserDefaults.standard.set(enabled, forKey: localSafeModeKey)
+  }
+
+  static var lastCheckAt: Int64? {
+    (UserDefaults.standard.object(forKey: lastCheckAtKey) as? NSNumber)?.int64Value
+  }
+
+  static var lastCheckResult: String? {
+    UserDefaults.standard.string(forKey: lastCheckResultKey)
+  }
+
+  static func setLastCheck(at: Int64, result: String) {
+    UserDefaults.standard.set(NSNumber(value: at), forKey: lastCheckAtKey)
+    UserDefaults.standard.set(result, forKey: lastCheckResultKey)
   }
 }

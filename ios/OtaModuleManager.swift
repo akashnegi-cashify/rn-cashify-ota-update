@@ -12,12 +12,23 @@ public final class OtaModuleManager {
 
   private let lock = NSLock()
   private var bundleVersionMap: [String: String] = [:]
+  /// Tail of the check chain; each new pass waits for it before running.
+  private var currentCheck: Task<String, Never>?
+  /// Passes queued or running. Guarded by `lock`.
+  private var pendingChecks = 0
+
+  /// True while any `loadBundles` pass is queued or running.
+  public var checkInFlight: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return pendingChecks > 0
+  }
 
   private init() {}
 
   /// Synchronous, local-only app.json parse — safe on the launch path. Never
   /// throws; on any failure the module map stays empty and OTA is disabled.
   public func initModules() {
+    Log.load()
     guard !initialized else { return }
     initialized = true
     guard let url = Bundle.main.url(forResource: "app", withExtension: "json") else {
@@ -71,19 +82,56 @@ public final class OtaModuleManager {
   /// stale/rollback cleanup. Downloaded bundles are picked up on the NEXT launch.
   public func loadBundlesAsync() {
     Task.detached(priority: .background) {
-      await self.loadBundles()
+      _ = await self.loadBundles()
     }
   }
 
-  private func loadBundles() async {
+  /// One full check. Serialised like Android: a concurrent caller waits for the
+  /// running pass, then runs its OWN pass with its own `forceFetch`. Every pass
+  /// records the last check time + summary and returns its summary string.
+  public func loadBundles(forceFetch: Bool = false) async -> String {
+    let task = claimCheck(forceFetch: forceFetch)
+    let summary = await task.value
+    releaseCheck()
+    OtaPreferences.setLastCheck(at: Int64(Date().timeIntervalSince1970 * 1000), result: summary)
+    Log.d("OtaModuleManager::check result: \(summary)")
+    return summary
+  }
+
+  // Synchronous so NSLock is never held across (or called from) an await.
+  private func claimCheck(forceFetch: Bool) -> Task<String, Never> {
+    lock.lock()
+    defer { lock.unlock() }
+    let previous = currentCheck
+    let task = Task<String, Never> {
+      _ = await previous?.value
+      return await self.runCheck(forceFetch: forceFetch)
+    }
+    currentCheck = task
+    pendingChecks += 1
+    return task
+  }
+
+  private func releaseCheck() {
+    lock.lock()
+    defer { lock.unlock() }
+    pendingChecks -= 1
+    if pendingChecks == 0 { currentCheck = nil }
+  }
+
+  private func runCheck(forceFetch: Bool) async -> String {
     initModules()
     let otaModules = modules.values.filter { $0.otaUpdates }
     guard !otaModules.isEmpty else {
       Log.d("OtaModuleManager::no OTA modules configured, skipping")
-      return
+      return "skipped: no OTA modules configured"
     }
 
     OtaBundleManager.cleanupTemporaryBundles()
+
+    if forceFetch, !(await OtaRemoteConfig.refresh()) {
+      Log.w("OtaModuleManager::forced Remote Config refresh failed, using cached values")
+    }
 
     // Global kill switch: wipes EVERY module and stops the whole check.
     if await OtaRemoteConfig.getEnableSafeMode() {
@@ -93,10 +141,11 @@ public final class OtaModuleManager {
       }
       // Persisted locally so the NEXT launch stays on the asset bundle even offline.
       OtaPreferences.setSafeModeEnabled(true)
-      return
+      return "skipped: global safe mode enabled"
     }
     OtaPreferences.setSafeModeEnabled(false)
 
+    var results: [String] = []
     let sortedModules = otaModules.sorted {
       ($0.bundlePriority, $0.moduleName) < ($1.bundlePriority, $1.moduleName)
     }
@@ -106,14 +155,21 @@ public final class OtaModuleManager {
         Log.d("OtaModuleManager::module safe mode enabled for \(module.moduleName), clearing its bundles")
         OtaBundleManager.cleanupModuleBundles(module: module)
         OtaPreferences.setModuleSafeModeEnabled(module.configKey, true)
+        results.append("\(module.moduleName): skipped: module safe mode enabled")
         continue
       }
       OtaPreferences.setModuleSafeModeEnabled(module.configKey, false)
 
       Log.d("OtaModuleManager::checking module: \(module.moduleName), priority: \(module.bundlePriority)")
-      await OtaBundleManager.downloadBundleIfNeeded(module: module)
+      let result = await OtaBundleManager.downloadBundleIfNeeded(module: module)
       await OtaBundleManager.cleanupStaleBundles(module: module)
+      results.append("\(module.moduleName): \(result.description)")
     }
+    return results.joined(separator: "; ")
+  }
+
+  func allModules() -> [OtaModule] {
+    Array(modules.values)
   }
 
   func launcherModule() -> OtaModule? {
