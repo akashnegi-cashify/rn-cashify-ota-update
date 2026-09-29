@@ -348,6 +348,7 @@ object OtaBundleManager {
 
     /** True when `version` is exactly what the next launch would boot (mirrors getLauncherBundleFilePathLocal). */
     internal fun willBootNextLaunch(context: Context, module: OtaModule, version: String): Boolean {
+        if (HostAppInfo.isDebuggable(context)) return false
         if (!module.launcher) return false
         if (OtaPreferences.isSafeModeEnabled(context) || OtaPreferences.isLocalSafeModeEnabled(context) ||
             OtaPreferences.isModuleSafeModeEnabled(context, module.configKey)) return false

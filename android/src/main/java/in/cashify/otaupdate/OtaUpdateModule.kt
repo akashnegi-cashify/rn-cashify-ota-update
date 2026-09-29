@@ -1,6 +1,7 @@
 package `in`.cashify.otaupdate
 
 import android.content.Context
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -17,6 +18,15 @@ import java.io.FileNotFoundException
  * - getOtaBundleVersion(): version of the JS bundle this session booted with.
  * - getFileSystemURL(moduleName): `file://` URL of any configured module's
  *   bundle — for JS-side loaders of non-launcher modules, and debugging.
+ * - getOtaStatus(): debug snapshot of OTA state (see [OtaStatus]).
+ * - getOtaLogs(): the in-memory ring buffer of captured log lines.
+ * - clearOtaLogs(): clears the in-memory + persisted log buffer.
+ * - checkForUpdates(): full check with a forced Remote Config refresh; resolves
+ *   with the summary string.
+ * - deleteDownloadedBundles(): wipes every module's downloaded + temporary bundles.
+ * - setLocalSafeMode(enabled): local-only safe-mode override for debugging.
+ *
+ * Emits two events (see [OtaEvents]): `CashifyOtaLog` and `CashifyOtaProgress`.
  */
 class OtaUpdateModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -77,6 +87,69 @@ class OtaUpdateModule(private val reactContext: ReactApplicationContext) :
                 promise.reject(NAME, "Error getting file system URL", e)
             }
         }
+    }
+
+    @ReactMethod
+    fun getOtaStatus(promise: Promise) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                promise.resolve(OtaStatus.snapshot(reactContext.applicationContext))
+            } catch (t: Throwable) {
+                OtaLog.e("OtaUpdateModule::getOtaStatus failed", t)
+                promise.reject(NAME, t.message ?: "getOtaStatus failed", t)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun getOtaLogs(promise: Promise) {
+        val array = Arguments.createArray()
+        OtaLog.entries().forEach { array.pushMap(it.toWritableMap()) }
+        promise.resolve(array)
+    }
+
+    @ReactMethod
+    fun clearOtaLogs(promise: Promise) {
+        OtaLog.clear()
+        OtaLog.d("OtaUpdateModule::logs cleared from debug screen")
+        promise.resolve(null)
+    }
+
+    /** Full check with a forced Remote Config refresh; resolves with the summary string. */
+    @ReactMethod
+    fun checkForUpdates(promise: Promise) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                OtaLog.d("OtaUpdateModule::checkForUpdates requested from debug screen")
+                promise.resolve(OtaModuleManager.loadBundles(reactContext.applicationContext, forceFetch = true))
+            } catch (t: Throwable) {
+                promise.reject(NAME, t.message ?: "checkForUpdates failed", t)
+            }
+        }
+    }
+
+    /** Wipes every module's downloaded bundles + temp files. Next launch boots the shipped asset. */
+    @ReactMethod
+    fun deleteDownloadedBundles(promise: Promise) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val context = reactContext.applicationContext
+                OtaModuleManager.init(context)
+                OtaLog.d("OtaUpdateModule::deleteDownloadedBundles requested from debug screen")
+                OtaModuleManager.modules.values.forEach { OtaBundleManager.cleanupModuleBundles(context, it) }
+                OtaBundleManager.cleanupTemporaryBundles(context)
+                promise.resolve(null)
+            } catch (t: Throwable) {
+                promise.reject(NAME, t.message ?: "deleteDownloadedBundles failed", t)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun setLocalSafeMode(enabled: Boolean, promise: Promise) {
+        OtaPreferences.setLocalSafeModeEnabled(reactContext.applicationContext, enabled)
+        OtaLog.d("OtaUpdateModule::local safe-mode override set to $enabled")
+        promise.resolve(null)
     }
 
     /**
