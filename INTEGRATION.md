@@ -292,7 +292,12 @@ Least to most drastic (all take effect within ~5 min + next launch):
 
 ```text
 1. ROLLBACK one module      rnb_myshop_latest_version: 1.0.1 → 1.0.0
-                            devices delete the 1.0.1 bundle, run 1.0.0/shipped
+                            launch 1: still runs 1.0.1, background check deletes it
+                            launch 2: boots the SHIPPED bundle, re-downloads 1.0.0
+                              (the 1.0.0 folder was removed when 1.0.1 installed —
+                               the 1.0.0 artifact must still exist on the CDN)
+                            launch 3: boots 1.0.0. Rolling back to the shipped
+                              version itself (or "") ends at launch 2.
 2. KILL one module          rnb_myshop_enable_safe_mode = true
                             myshop pins to its shipped bundle; other modules unaffected
 3. KILL everything          rn_enable_safe_mode = true
@@ -310,7 +315,7 @@ Add more entries to `otaModules` — e.g. a `Reports` module
 (`configKey: "reports"`, `modulePath: "myshop-reports"`, `launcher: false`):
 
 - Its own RC keys: `rnb_reports_latest_version`, `rnb_reports_enable_safe_mode`.
-- Publish with `yarn ota:build:native --module=Reports --ota-version=2.1.0 ...`.
+- Publish with `yarn cashify-ota-publish --module=Reports --ota-version=2.1.0 ...`.
 - Download/rollback/kill switch are fully independent of other modules.
 - Only the launcher boots natively; load a non-launcher bundle from JS:
 
@@ -322,10 +327,76 @@ const url = await getFileSystemURL('Reports'); // file://... for your loader
 ## JS API
 
 ```ts
-import {getOtaBundleVersion, getFileSystemURL, isOtaUpdateAvailable} from 'rn-cashify-ota-update';
+import {
+  // core
+  isOtaUpdateAvailable, getOtaBundleVersion, getFileSystemURL,
+  // debug API (v0.2.0+)
+  getOtaStatus, getOtaLogs, clearOtaLogs, checkForUpdates,
+  deleteDownloadedBundles, setLocalSafeMode, addOtaListener,
+  type OtaStatus, type OtaLogEntry, type OtaProgress,
+} from 'rn-cashify-ota-update';
 
-getOtaBundleVersion();  // "1.0.1" when an OTA bundle booted, else the app versionName
+isOtaUpdateAvailable();  // false when the native module is not linked (then every call below throws LINKING_ERROR)
+getOtaBundleVersion();   // "1.0.1" when an OTA bundle booted, else the app versionName
+await getFileSystemURL('Reports'); // file:// URL of a module's active bundle (non-launcher loaders)
 ```
+
+### Debug API (build an "OTA Status" screen)
+
+Everything the native side knows is exposed read-only through `getOtaStatus()`
+and `getOtaLogs()`, plus four actions. None of these run on the launch path.
+
+| Call | What it does |
+|---|---|
+| `getOtaStatus(): Promise<OtaStatus>` | Local-only snapshot: booted bundle version and whether it came from disk, installed app version, `debuggable`, the launcher module config, **cached** Remote Config values (`bundleUrl`, `latestVersion`, safe-mode flags, last fetch status/time, the resolved download URL), local state (persisted safe-mode flags, `localSafeModeOverride`, `lastCheckAt`, `lastCheckResult`, `checkInFlight`) and every downloaded bundle on disk (`version`, `path`, `sizeBytes`, `valid`, `modifiedAt`, `willBootNextLaunch`). Never fetches. |
+| `getOtaLogs(): Promise<OtaLogEntry[]>` | The last 300 `CashifyOTA` log lines (`{ts, level: 'D'\|'W'\|'E', message}`), oldest first, persisted across launches (`<filesDir>/cashify_ota/logs.jsonl` on Android, `Application Support/cashify_ota/logs.jsonl` on iOS). |
+| `clearOtaLogs()` | Empties the buffer and the file. |
+| `checkForUpdates(): Promise<string>` | Forces a Remote Config refresh (bypasses the 300 s cache) and runs the same check as launch. Resolves with a summary such as `MyShop: downloaded 1.0.2`, `MyShop: up to date`, `MyShop: skipped: rn_bundle_url empty` or `MyShop: error: <reason>`. Concurrent calls are serialised natively; each waits for the running pass and then runs its own. |
+| `deleteDownloadedBundles()` | Wipes every module's downloaded bundles and temp files. The next launch boots the shipped bundle. |
+| `setLocalSafeMode(enabled)` | Debug override that pins the **next launch** to the shipped bundle. Stored in its own preference; Remote Config never clears it, downloads are not blocked by it. Turn it off from the same screen. |
+| `addOtaListener(event, cb) => unsubscribe` | `'CashifyOtaLog'` → `OtaLogEntry` for every new log line; `'CashifyOtaProgress'` → `{moduleName, bytesRead, totalBytes, done}` during a download (Android streams real byte counts throttled to ~250 ms; iOS emits only start `{bytesRead: 0, totalBytes: -1, done: false}` and end `{done: true}` because its downloader does not stream). No-op when the module is unlinked. |
+
+Platform notes: iOS has no offline pre-check, so an offline `checkForUpdates`
+resolves `error: …` where Android resolves `skipped: network not available`.
+`willBootNextLaunch` is always `false` on debuggable builds (the launch path
+never loads a disk bundle there), even though downloads still work for testing.
+
+Minimal hook a host app can copy (the Cashify Ops app ships a full screen
+built on exactly this — hook + pure widget + `Alert.alert` confirms on the
+two destructive actions):
+
+```ts
+import {useCallback, useEffect, useState} from 'react';
+import {addOtaListener, getOtaLogs, getOtaStatus, isOtaUpdateAvailable,
+        type OtaLogEntry, type OtaStatus} from 'rn-cashify-ota-update';
+
+export function useOtaStatus() {
+  const available = isOtaUpdateAvailable();
+  const [status, setStatus] = useState<OtaStatus>();
+  const [logs, setLogs] = useState<OtaLogEntry[]>([]);
+
+  const refresh = useCallback(async () => {
+    if (!available) return;
+    const [s, l] = await Promise.allSettled([getOtaStatus(), getOtaLogs()]);
+    if (s.status === 'fulfilled') setStatus(s.value);
+    if (l.status === 'fulfilled') setLogs(l.value.slice(-300));
+  }, [available]);
+
+  useEffect(() => {
+    void refresh();
+    if (!available) return undefined;
+    const off = addOtaListener('CashifyOtaLog', (e) => setLogs((p) => [...p, e].slice(-300)));
+    return off;
+  }, [available, refresh]);
+
+  return {available, status, logs, refresh};
+}
+```
+
+Gate the screen the way you gate any other debug surface (the Ops app opens
+it from a long-press on the version text on stage/beta, and only behind a
+dev-mode toggle plus passcode on prod). `deleteDownloadedBundles` and
+`clearOtaLogs` are destructive; confirm before calling them.
 
 ## Verification checklist (run once per platform on stage)
 
@@ -333,7 +404,11 @@ getOtaBundleVersion();  // "1.0.1" when an OTA bundle booted, else the app versi
 2. Publish + set the version key → relaunch → "downloading remote bundle" →
    "bundle installed at".
 3. Relaunch → "loading disk bundle <v>"; `getOtaBundleVersion()` = `<v>`.
-4. Rollback (lower the key) → relaunch twice → "rollback detected", then asset.
+4. Rollback (lower the key to an older OTA version) → relaunch → "rollback
+   detected"; relaunch → shipped bundle + "downloading remote bundle <older>";
+   relaunch → "loading disk bundle <older>". (Lowering to the shipped version
+   stops after the second relaunch.) With the debug API, `checkForUpdates()`
+   replaces each wait for the Remote Config cache.
 5. Kill switch on → bundles wipe; relaunch in airplane mode → still shipped
    bundle. Off → re-download.
 6. Airplane-mode fresh install → RC timeout logs, normal startup, no crash.
